@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Wemos D1 R32 - Finger Control</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; display: flex; flex-direction: column; align-items: center; background: #1a1a1a; color: white; padding: 20px; margin: 0; }
+        .ui { background: #2d2d2d; padding: 20px; border-radius: 15px; text-align: center; margin-bottom: 20px; width: 100%; max-width: 800px; border: 1px solid #444; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+        button { padding: 15px 40px; font-size: 18px; cursor: pointer; background: #e67e22; color: white; border: none; border-radius: 30px; font-weight: bold; }
+        button:disabled { background: #555; color: #888; cursor: not-allowed; }
+        #status { margin-top: 20px; font-size: 24px; font-weight: bold; }
+        .finger-box { display: inline-block; margin: 5px; padding: 8px 12px; border-radius: 8px; background: #444; font-size: 16px; }
+        .on { color: #55efc4; border: 1px solid #55efc4; text-shadow: 0 0 5px rgba(85,239,196,0.5); }
+        .off { color: #ff7675; border: 1px solid #ff7675; }
+        canvas { transform: scaleX(-1); border: 4px solid #444; border-radius: 12px; width: 100%; max-width: 800px; height: auto; }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <button id="connectBtn">Wemos D1 R32 に接続</button>
+        <div id="status">ステータス: 未接続</div>
+        <div id="finger_indicator"></div>
+    </div>
+
+    <canvas id="output_canvas"></canvas>
+    <video id="input_video" style="display:none;"></video>
+
+<script>
+const S_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const C_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+let char = null;
+let lastSentFingers = [false, false, false, false, false];
+let syncTimer = null;
+
+const btn = document.getElementById('connectBtn');
+const status = document.getElementById('status');
+const fingerIndicator = document.getElementById('finger_indicator');
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+
+const FINGER_CONFIG = [
+    { name: "親", tip: 4, base: 3, color: "#FF0000" },
+    { name: "人", tip: 8, base: 6, color: "#0000FF" },
+    { name: "中", tip: 12, base: 10, color: "#FFFF00" },
+    { name: "薬", tip: 16, base: 14, color: "#00FF00" },
+    { name: "小", tip: 20, base: 18, color: "#FFC0CB" }
+];
+
+btn.onclick = async () => {
+    try {
+        const device = await navigator.bluetooth.requestDevice({
+            filters: [{ name: 'WEMOS-D1-R32-AI' }],
+            optionalServices: [S_UUID]
+        });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(S_UUID);
+        char = await service.getCharacteristic(C_UUID);
+        status.innerText = "接続成功！";
+        btn.disabled = true;
+        start();
+    } catch (e) { status.innerText = "接続失敗"; }
+};
+
+async function sendData(fingers) {
+    if (!char) return;
+    try {
+        const labels = ['T', 'I', 'M', 'R', 'P'];
+        const msg = labels.map((l, i) => `${l}:${fingers[i] ? 1 : 0}`).join(',') + '\n';
+        await char.writeValue(new TextEncoder().encode(msg));
+        lastSentFingers = [...fingers];
+    } catch (e) { console.error("BLE送信エラー"); }
+}
+
+const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+hands.setOptions({ maxNumHands: 2, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.7 });
+
+hands.onResults((res) => {
+    canvasElement.width = res.image.width;
+    canvasElement.height = res.image.height;
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(res.image, 0, 0, canvasElement.width, canvasElement.height);
+
+    let currentFingers = [false, false, false, false, false];
+
+    if (res.multiHandLandmarks && res.multiHandedness) {
+        for (let i = 0; i < res.multiHandLandmarks.length; i++) {
+            const lm = res.multiHandLandmarks[i];
+            const label = res.multiHandedness[i].label;
+
+            FINGER_CONFIG.forEach((finger, idx) => {
+                let isRaised = false;
+                if (idx === 0) {
+                    if (label === 'Right') { if (lm[finger.tip].x < lm[finger.base].x) isRaised = true; }
+                    else { if (lm[finger.tip].x > lm[finger.base].x) isRaised = true; }
+                } else {
+                    if (lm[finger.tip].y < lm[finger.base].y) isRaised = true;
+                }
+                if (isRaised) currentFingers[idx] = true;
+            });
+            drawConnectors(canvasCtx, lm, HAND_CONNECTIONS, {color: 'rgba(255,255,255,0.3)', lineWidth: 2});
+        }
+    }
+
+    // 200ms 同期ロジック
+    const hasChanged = currentFingers.some((val, idx) => val !== lastSentFingers[idx]);
+    if (hasChanged && !syncTimer) {
+        syncTimer = setTimeout(() => {
+            sendData(currentFingers);
+            syncTimer = null;
+        }, 200);
+    }
+
+    updateUI(currentFingers);
+    canvasCtx.restore();
+});
+
+function updateUI(fingers) {
+    fingerIndicator.innerHTML = FINGER_CONFIG.map((f, i) => {
+        return `<span class="finger-box ${fingers[i] ? 'on' : 'off'}">${f.name}: ${fingers[i] ? 'ON' : 'OFF'}</span>`;
+    }).join('');
+}
+
+function start() {
+    const cam = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({image: videoElement}); },
+        width: 1280, height: 720
+    });
+    cam.start();
+}
+</script>
+</body>
+</html>
